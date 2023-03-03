@@ -16,8 +16,115 @@
 
 import xapi from 'xapi';
 const TOKEN = ''; //BOT Token
-const listOfDomains = ['test.com', 'example.com', 'example2.com'];
-const listOfEmails = ['user@example.com'];
+const listOfDomains = ['test.com', 'example.com', 'example2.com']; //do not include the @ simbol eg: example.com, separate with commas if multiple domains present
+const listOfEmails = ['example1@cisco.com']; //full email address, separate with commas if mutiple emails present
+const personalDeviceModels = ['dx80','deskpro','roomkit']; //// list of device models that could appear in the URI of personal devices to check for.
+
+const IGNORE=0;
+const END=1;
+
+const PERSONAL_UNKNOWN_ACTION = IGNORE; // Action to take on personal devices for unknown calls
+const SHARED_UNKNOWN_ACTION =  END; // Action to take on shared devices for unknown calls
+const PERSONAL_UNKNOWN_SHOW_ALERT = true; // Show alert message prompt for unknown calls on personal devices?
+const SHARED_UNKNOWN_SHOW_ALERT = false; // Show alert message prompt for unknown calls on shared devices?
+
+
+var susCallOffering=false;
+var isPersonal=false;
+
+async function getURI()
+{
+   let deviceURI = await xapi.Status.UserInterface.ContactInfo.ContactMethod[1].Number.get()
+   return deviceURI
+}
+
+
+async function init() {
+
+  let theURI=await getURI();
+  console.log('URI: ',theURI);
+  if (theURI.includes('.call.')) isPersonal=true;
+  let ampPos=theURI.indexOf("@")
+  if (ampPos>0) {
+    let theName=theURI.substring(0,ampPos)
+    let undPos=theName.lastIndexOf("_")
+    if (undPos>0) {
+      let deviceName=theName.substring(undPos+1)
+      if (personalDeviceModels.includes(deviceName.toLowerCase())) isPersonal=true;
+    }
+  }
+  console.log('isPersonal=',isPersonal)
+}
+
+function takeBlockedAction(CallId) {
+    susCallOffering=true
+    if (isPersonal) {
+      // personal mode device
+      if (PERSONAL_UNKNOWN_ACTION==IGNORE) {
+        xapi.Command.Call.Ignore({ CallId: CallId });
+        if (PERSONAL_UNKNOWN_SHOW_ALERT) displaySuspiciosCall();
+      } else xapi.Command.Call.Reject({ CallId: CallId });
+    } else {
+      // shared mode device
+      if (SHARED_UNKNOWN_ACTION==IGNORE) {
+        xapi.Command.Call.Ignore({ CallId: CallId });
+        if (SHARED_UNKNOWN_SHOW_ALERT) displaySuspiciosCall();
+      } else xapi.Command.Call.Reject({ CallId: CallId });
+  
+    }
+  }
+  
+
+
+function displaySuspiciosCall() {
+    xapi.Command.UserInterface.Message.Prompt.Display(
+      { FeedbackId: 'displayPrompt', 
+      'Option.1':'Ok', 
+      Text: '🛑 🛑 🛑  Call from possible fraudulent source‼️', 
+      Title: 'SUSPICIOUS CALL' });
+}
+
+xapi.Event.CallSuccessful.on( (status) => {
+    console.log(status);
+    console.log("Detected successful call, Turning ON DND");
+    console.log('User is in a meeting *********')
+    susCallOffering=false;
+    xapi.Command.Conference.DoNotDisturb.Activate();
+    xapi.Command.UserInterface.Message.Prompt.Clear(
+        { FeedbackId: 'displayPrompt' });
+});
+
+xapi.Event.CallDisconnect.on( () => {
+    console.log("Detected call disconnect, Turning OFF DND");
+    xapi.Command.Conference.DoNotDisturb.Deactivate();
+    susCallOffering=false;
+    xapi.Command.UserInterface.Message.Prompt.Clear(
+    { FeedbackId: 'displayPrompt' });
+});
+
+xapi.event.on('UserInterface Message Prompt Response', (event) =>
+{
+  switch(event.FeedbackId){
+    case 'displayPrompt':
+      if (susCallOffering) {
+          console.log("Redisplaying the prompt");
+          displaySuspiciosCall();
+        }
+    break;
+  }
+});
+
+xapi.event.on('UserInterface Message Prompt Cleared', (event) =>
+{
+  switch(event.FeedbackId){
+    case 'displayPrompt':
+      if (susCallOffering) {
+          console.log("Redisplaying the prompt");
+          displaySuspiciosCall();
+        }
+    break;
+  }
+});
 
 
 xapi.Status.Call
@@ -30,6 +137,7 @@ xapi.Status.Call
         let Direction = value['Direction'];
         let RemoteNumber = value['RemoteNumber'];
         let Status = value['Status'];
+        const CallId = value['id'];
 
         // console.log(`Answer State = ${AnswerState}`);
         // console.log(`Callback Number = ${CallbackNumber}`);
@@ -37,15 +145,9 @@ xapi.Status.Call
         // console.log(`Remote Number = ${RemoteNumber}`);
         // console.log(`Status = ${Status}`);
 
-        //Outgoing IF --- NO NEED FOR OUTGOING CALL TREATMENT
-        // if(Direction == 'Outgoing') {
-        //   console.log(`The call's direction is OUTGOING`);
-        // }
-
         //Incoming IF
         if(Direction == 'Incoming' && Status == 'Ringing') {
             console.log(`Call direction INCOMING`)
-
 
             //--- USED FOR CALL THAT DO HAVE @ SIMBOL
             if(CallbackNumber.search("@") > 0){
@@ -66,12 +168,12 @@ xapi.Status.Call
 
                 } else {
                     //Else the call is blocked
-                    console.log('Domain or Email blocked')
-                    xapi.Command.UserInterface.Message.Alert.Display({Text: 'The incoming call was not allowed by a user script on the device', Duration: 15,});
-                    xapi.Command.Call.Disconnect();
-                    console.log(`Call NOT ALLOWED, Disconecting call from the following calling number: ${incomingCallingEmail1}`)
+                    console.log('Domain or Email not allowed')
+                    // xapi.Command.UserInterface.Message.Alert.Display({Text: 'The incoming call was not allowed by a user script on the device', Duration: 15,});
+                    //xapi.Command.Call.Disconnect({CallId: CallId});
+                    console.log(`Call NOT ALLOWED, taking configurable action on call from the following calling number: ${incomingCallingEmail1}`)
+                    takeBlockedAction(CallId);
                 }
-
 
                 //---USED FOR CALLS WITHOUT @ SIMBOL --- ELSE TO EXTRACT EMAIL FROM WEBEX ID AND API CALL
             } else {
@@ -86,7 +188,6 @@ xapi.Status.Call
                 const headers = ['Content-Type: application/json','Authorization: Bearer ' + TOKEN];
                 xapi.Command.HttpClient.Get({Header: headers,ResultBody: 'PlainText',Url: POST_URL})
                     .then(result => {
-                        //IT IS IMPOSSIBLE TO VALIDATE WEBEX IDS FROM OTHER WEBEX ORGANIZATIONS, WE WOULD HAVE TO POSSESS THE ADMIN TOKEN OF EACH ORG TO BE ABLE TO VALIDATE. WE CAN ONLY VALIDATE WEBEX IDS FROM OUR OWN ORG
                         if(result != undefined){
                             // console.log(result);
                             console.log(`EMAIL FOUND FROM WEBEX ID, VALIDATING EMAIL OR DOMAIN`);
@@ -104,21 +205,30 @@ xapi.Status.Call
                                 console.log('Domain or Email permited');
 
                             } else {
-                                //Else the call is blocked
-                                console.log('Domain or Email blocked');
-                                xapi.Command.UserInterface.Message.Alert.Display({Text: 'The incoming call was not allowed by a user script on the device', Duration: 15,});
-                                xapi.Command.Call.Disconnect();
-                                console.log(`Call NOT ALLOWED, Disconecting call from the following calling number: ${incomingCallingEmail}`)
+                                // Else the call is blocked // BLOCKING CALL ########################################
+                                console.log(`Domain or Email not allowed - ${CallId}`);
+                                //xapi.Command.Call.Disconnect({CallId: CallId});
+                                console.log(`Call NOT ALLOWED, WILL NOT ALERT call from the following calling number: ${incomingCallingEmail}`);
+                                takeBlockedAction(CallId);
                             }
                         } else {
-                            //WEBEX IDS FROM OTHER WEBEX ORGS OR UNKNOWEND ORGS WILL BE BLOCKED
+                            //WEBEX IDS FROM OTHER WEBEX ORGS OR UNKNOWNED ORGS WILL BE BLOCKED
                             console.log(`EMAIL NOT FOUND FROM WEBEX ID, CANNOT VALIDATE EMAIL OR DOMAIN`);
-                            console.log('Not possible to validate - Domain or Email blocked');
+                            console.log('Not possible to validate - Domain or Email not allowed');
                             xapi.Command.UserInterface.Message.Alert.Display({Text: 'The incoming could not be validated', Duration: 15,});
-                            xapi.Command.Call.Disconnect();
+                            //xapi.Command.Call.Disconnect();
+                            takeBlockedAction(CallId);
                             console.log(`Call NOT ALLOWED`)
                         }
                     })
             }
         }
     })
+
+    init();
+
+
+
+
+
+
